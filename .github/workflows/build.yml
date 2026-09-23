@@ -1,0 +1,151 @@
+name: Build sing-box Rule Sets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "rules/**"
+      - ".github/workflows/build.yml"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. 拉取仓库
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # 2. 安装 Python
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      # 3. 安装 sing-box
+      - name: Install sing-box
+        shell: bash
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep '"tag_name":' \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+
+          VERSION=${VERSION#v}
+
+          echo "Installing sing-box ${VERSION}"
+
+          wget -q \
+            "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz"
+
+          tar -xzf \
+            "sing-box-${VERSION}-linux-amd64.tar.gz"
+
+          sudo mv \
+            "sing-box-${VERSION}-linux-amd64/sing-box" \
+            /usr/local/bin/sing-box
+
+          sing-box version
+
+      # 4. TXT -> JSON
+      - name: Generate JSON
+        shell: bash
+        run: |
+          mkdir -p json
+
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+
+          rules_dir = Path("rules")
+          json_dir = Path("json")
+
+          json_dir.mkdir(parents=True, exist_ok=True)
+
+          for txt_file in rules_dir.glob("*.txt"):
+              domains = []
+
+              for line in txt_file.read_text(
+                  encoding="utf-8"
+              ).splitlines():
+
+                  line = line.strip()
+
+                  # 忽略空行
+                  if not line:
+                      continue
+
+                  # 忽略注释
+                  if line.startswith("#"):
+                      continue
+
+                  domains.append(line)
+
+              # 去重 + 排序
+              domains = sorted(set(domains))
+
+              data = {
+                  "version": 5,
+                  "rules": [
+                      {
+                          "domain_suffix": domains
+                      }
+                  ]
+              }
+
+              output = json_dir / f"{txt_file.stem}.json"
+
+              output.write_text(
+                  json.dumps(
+                      data,
+                      ensure_ascii=False,
+                      indent=2
+                  ) + "\n",
+                  encoding="utf-8"
+              )
+
+              print(
+                  f"{txt_file} -> {output} "
+                  f"({len(domains)} domains)"
+              )
+          PY
+
+      # 5. JSON -> SRS
+      - name: Compile SRS
+        shell: bash
+        run: |
+          mkdir -p srs
+
+          for json_file in json/*.json; do
+              filename=$(basename "$json_file" .json)
+
+              echo "Compiling $json_file"
+
+              sing-box rule-set compile \
+                --output "srs/${filename}.srs" \
+                "$json_file"
+          done
+
+          ls -lh srs/
+
+      # 6. 提交自动生成的 JSON 和 SRS
+      - name: Commit generated files
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add json/ srs/
+
+          if git diff --cached --quiet; then
+            echo "No generated file changes."
+            exit 0
+          fi
+
+          git commit -m "build: update rule sets"
+          git push
